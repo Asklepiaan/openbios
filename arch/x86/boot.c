@@ -11,8 +11,326 @@
 #include "libopenbios/bindings.h"
 #include "arch/common/nvram.h"
 #include "libc/diskio.h"
+#include "libc/string.h"
+#include "asm/io.h"
+#include "kernel/kernel.h"
 #include "libopenbios/sys_info.h"
 #include "boot.h"
+
+#define WINTERBOOT_PAYLOAD_PHYSICAL 0x00020000u
+#define WINTERBOOT_STACK_PHYSICAL 0x00170000u
+#define WINTERBOOT_STACK_SIZE 0x0000f000u
+#define WINTERBOOT_PAYLOAD_MAGIC 0x504c4d57u
+#define WINTERBOOT_PAYLOAD_VERSION 1u
+#define WINTERBOOT_PAYLOAD_HEADER_SIZE 16u
+#define WINTERBOOT_COMPRESSED_MAGIC 0x50434257u
+#define WINTERBOOT_COMPRESSED_VERSION 1u
+#define WINTERBOOT_COMPRESSED_HEADER_SIZE 16u
+#define WINTERBOOT_POLL_COUNT 0x20000u
+#define WINTERBOOT_KEYBOARD_STATUS_PORT 0x64
+#define WINTERBOOT_KEYBOARD_DATA_PORT 0x60
+#define WINTERBOOT_KEYBOARD_DATA_READY 0x01
+#define WINTERBOOT_O_SCANCODE 0x18
+#define WINTERBOOT_RUNTIME_STATE_PHYSICAL 0x00006000u
+#define WINTERBOOT_RS_HEAP_LIMIT_PHYSICAL 136u
+#define WINTERBOOT_RS_HEAP_REGION_COUNT 140u
+#define WINTERBOOT_RS_HEAP_REGION_TABLE 144u
+#define WINTERBOOT_HEAP_REGION_MAX 16u
+#define WINTERBOOT_HEAP_REGION_SIZE 8u
+#define WINTERBOOT_HEAP_START_PHYSICAL 0x00300000u
+#define WINTERBOOT_PAGE_SIZE 0x1000u
+
+extern const unsigned char winterboot_payload_start[];
+extern const unsigned char winterboot_payload_end[];
+
+static uint32_t winterboot_read_le32(const unsigned char *data)
+{
+	return (uint32_t)data[0] |
+		((uint32_t)data[1] << 8) |
+		((uint32_t)data[2] << 16) |
+		((uint32_t)data[3] << 24);
+}
+
+static uint32_t *winterboot_runtime_word(uint32_t offset)
+{
+	return phys_to_virt(WINTERBOOT_RUNTIME_STATE_PHYSICAL + offset);
+}
+
+static uint32_t winterboot_runtime_read32(uint32_t offset)
+{
+	return *winterboot_runtime_word(offset);
+}
+
+static void winterboot_runtime_write32(uint32_t offset, uint32_t value)
+{
+	*winterboot_runtime_word(offset) = value;
+}
+
+static uint32_t winterboot_align_down(uint32_t value, uint32_t alignment)
+{
+	return value & ~(alignment - 1u);
+}
+
+static uint32_t winterboot_align_up(uint32_t value, uint32_t alignment)
+{
+	return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+static void winterboot_append_heap_region(uint32_t *starts,
+		uint32_t *sizes,
+		uint32_t *count,
+		uint32_t start,
+		uint32_t end)
+{
+	if (*count >= WINTERBOOT_HEAP_REGION_MAX || end <= start) {
+		return;
+	}
+	starts[*count] = start;
+	sizes[*count] = end - start;
+	++*count;
+}
+
+static void winterboot_reserve_heap_range(uint32_t reserve_start,
+		uint32_t reserve_end)
+{
+	uint32_t starts[WINTERBOOT_HEAP_REGION_MAX];
+	uint32_t sizes[WINTERBOOT_HEAP_REGION_MAX];
+	uint32_t in_count = winterboot_runtime_read32(WINTERBOOT_RS_HEAP_REGION_COUNT);
+	uint32_t out_count = 0;
+	uint32_t index;
+	uint32_t heap_limit;
+
+	if (reserve_end <= WINTERBOOT_HEAP_START_PHYSICAL || reserve_end <= reserve_start) {
+		return;
+	}
+	if (reserve_start < WINTERBOOT_HEAP_START_PHYSICAL) {
+		reserve_start = WINTERBOOT_HEAP_START_PHYSICAL;
+	}
+	reserve_start = winterboot_align_down(reserve_start, WINTERBOOT_PAGE_SIZE);
+	if (reserve_start < WINTERBOOT_HEAP_START_PHYSICAL) {
+		reserve_start = WINTERBOOT_HEAP_START_PHYSICAL;
+	}
+	reserve_end = winterboot_align_up(reserve_end, WINTERBOOT_PAGE_SIZE);
+
+	if (in_count > WINTERBOOT_HEAP_REGION_MAX) {
+		in_count = WINTERBOOT_HEAP_REGION_MAX;
+	}
+
+	for (index = 0; index < in_count; ++index) {
+		const uint32_t region_offset = WINTERBOOT_RS_HEAP_REGION_TABLE +
+			index * WINTERBOOT_HEAP_REGION_SIZE;
+		uint32_t start = winterboot_runtime_read32(region_offset);
+		uint32_t size = winterboot_runtime_read32(region_offset + 4u);
+		uint32_t end = start + size;
+
+		if (size == 0 || end <= start) {
+			continue;
+		}
+		if (end <= reserve_start || start >= reserve_end) {
+			winterboot_append_heap_region(starts, sizes, &out_count, start, end);
+			continue;
+		}
+		winterboot_append_heap_region(starts, sizes, &out_count, start, reserve_start);
+		winterboot_append_heap_region(starts, sizes, &out_count, reserve_end, end);
+	}
+
+	for (index = 0; index < out_count; ++index) {
+		const uint32_t region_offset = WINTERBOOT_RS_HEAP_REGION_TABLE +
+			index * WINTERBOOT_HEAP_REGION_SIZE;
+		winterboot_runtime_write32(region_offset, starts[index]);
+		winterboot_runtime_write32(region_offset + 4u, sizes[index]);
+	}
+	for (; index < WINTERBOOT_HEAP_REGION_MAX; ++index) {
+		const uint32_t region_offset = WINTERBOOT_RS_HEAP_REGION_TABLE +
+			index * WINTERBOOT_HEAP_REGION_SIZE;
+		winterboot_runtime_write32(region_offset, 0);
+		winterboot_runtime_write32(region_offset + 4u, 0);
+	}
+	winterboot_runtime_write32(WINTERBOOT_RS_HEAP_REGION_COUNT, out_count);
+
+	heap_limit = winterboot_runtime_read32(WINTERBOOT_RS_HEAP_LIMIT_PHYSICAL);
+	if (heap_limit > reserve_start) {
+		winterboot_runtime_write32(WINTERBOOT_RS_HEAP_LIMIT_PHYSICAL, reserve_start);
+	}
+}
+
+static void winterboot_reserve_openbios_memory(void)
+{
+	const uint32_t openbios_start = (uint32_t)virt_to_phys(&_start);
+	const uint32_t openbios_end = (uint32_t)virt_to_phys(&_end);
+	winterboot_reserve_heap_range(openbios_start, openbios_end);
+}
+
+static int winterboot_o_key_requested(void)
+{
+	unsigned int i;
+	int extended = 0;
+
+	for (i = 0; i < WINTERBOOT_POLL_COUNT; ++i) {
+		while (availchar()) {
+			const int ch = getchar();
+			if (ch == 'o' || ch == 'O') {
+				return 1;
+			}
+		}
+
+		if ((inb(WINTERBOOT_KEYBOARD_STATUS_PORT) & WINTERBOOT_KEYBOARD_DATA_READY) != 0) {
+			const unsigned char code = inb(WINTERBOOT_KEYBOARD_DATA_PORT);
+			if (code == 0xe0) {
+				extended = 1;
+			} else {
+				if (!extended && code == WINTERBOOT_O_SCANCODE) {
+					return 1;
+				}
+				extended = 0;
+			}
+		}
+		(void)inb(0x80);
+	}
+
+	return 0;
+}
+
+static int winterboot_read_packed_length(const unsigned char **cursor,
+		const unsigned char *end,
+		uint32_t *length)
+{
+	for (;;) {
+		unsigned char next;
+		if (*cursor >= end) {
+			return 0;
+		}
+		next = **cursor;
+		++*cursor;
+		if (*length > 0xffffffffu - next) {
+			return 0;
+		}
+		*length += next;
+		if (next != 255) {
+			return 1;
+		}
+	}
+}
+
+static int winterboot_decompress_payload(void *target, uint32_t *out_size)
+{
+	const unsigned char *packed = winterboot_payload_start;
+	const uint32_t blob_size = (uint32_t)(winterboot_payload_end - winterboot_payload_start);
+	uint32_t unpacked_size;
+	uint32_t packed_size;
+	const unsigned char *src;
+	const unsigned char *src_end;
+	unsigned char *dst = target;
+	unsigned char *dst_start = dst;
+	unsigned char *dst_end;
+
+	if (blob_size < WINTERBOOT_COMPRESSED_HEADER_SIZE ||
+			winterboot_read_le32(packed + 0) != WINTERBOOT_COMPRESSED_MAGIC ||
+			winterboot_read_le32(packed + 4) != WINTERBOOT_COMPRESSED_VERSION) {
+		return 0;
+	}
+
+	unpacked_size = winterboot_read_le32(packed + 8);
+	packed_size = winterboot_read_le32(packed + 12);
+	if (packed_size > blob_size - WINTERBOOT_COMPRESSED_HEADER_SIZE) {
+		return 0;
+	}
+
+	src = packed + WINTERBOOT_COMPRESSED_HEADER_SIZE;
+	src_end = src + packed_size;
+	dst_end = dst + unpacked_size;
+
+	while (src < src_end) {
+		unsigned char token = *src++;
+		uint32_t literal_length = token >> 4;
+		uint32_t match_length = token & 0x0f;
+		uint32_t offset;
+		unsigned char *match;
+
+		if (literal_length == 15 &&
+				!winterboot_read_packed_length(&src, src_end, &literal_length)) {
+			return 0;
+		}
+		if ((uint32_t)(dst_end - dst) < literal_length ||
+				(uint32_t)(src_end - src) < literal_length) {
+			return 0;
+		}
+		while (literal_length--) {
+			*dst++ = *src++;
+		}
+		if (src == src_end) {
+			break;
+		}
+		if (src_end - src < 2) {
+			return 0;
+		}
+		offset = (uint32_t)src[0] | ((uint32_t)src[1] << 8);
+		src += 2;
+		if (offset == 0 || (uint32_t)(dst - dst_start) < offset) {
+			return 0;
+		}
+
+		match_length += 4;
+		if ((token & 0x0f) == 15 &&
+				!winterboot_read_packed_length(&src, src_end, &match_length)) {
+			return 0;
+		}
+		if ((uint32_t)(dst_end - dst) < match_length) {
+			return 0;
+		}
+		match = dst - offset;
+		while (match_length--) {
+			*dst++ = *match++;
+		}
+	}
+
+	if (src != src_end || dst != dst_end) {
+		return 0;
+	}
+	*out_size = unpacked_size;
+	return 1;
+}
+
+void winterboot(void)
+{
+	uint32_t *header;
+	uint32_t entry;
+	uint32_t image_size;
+	void *target;
+
+	if (winterboot_o_key_requested()) {
+		printk("OpenBIOS autoboot interrupted.\n");
+		return;
+	}
+
+	target = phys_to_virt(WINTERBOOT_PAYLOAD_PHYSICAL);
+	if (!winterboot_decompress_payload(target, &image_size)) {
+		printk("WinterBoot payload could not be decompressed.\n");
+		return;
+	}
+
+	header = (uint32_t *)target;
+	if (image_size < WINTERBOOT_PAYLOAD_HEADER_SIZE ||
+			header[0] != WINTERBOOT_PAYLOAD_MAGIC ||
+			header[1] != WINTERBOOT_PAYLOAD_VERSION ||
+			header[3] < WINTERBOOT_PAYLOAD_HEADER_SIZE ||
+			header[3] > image_size) {
+		printk("WinterBoot payload is invalid.\n");
+		return;
+	}
+
+	entry = header[2];
+	if (entry < WINTERBOOT_PAYLOAD_PHYSICAL ||
+			entry >= WINTERBOOT_PAYLOAD_PHYSICAL + image_size) {
+		printk("WinterBoot entry point is invalid.\n");
+		return;
+	}
+
+	winterboot_reserve_openbios_memory();
+	printk("Booting WinterBoot from OpenBIOS...\n");
+	printk("WinterBoot returned 0x%x.\n",
+			start_raw(entry, WINTERBOOT_STACK_PHYSICAL, WINTERBOOT_STACK_SIZE));
+}
 
 void go(void)
 {

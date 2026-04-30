@@ -54,6 +54,11 @@ finish-device
   set-defaults
 ; SYSTEM-initializer
 
+:noname
+  " true" " auto-boot?" $setenv
+  " winterboot" " boot-command" $setenv
+; SYSTEM-initializer
+
 \ preopen device nodes (and store the ihandles under /chosen)
 :noname
   " memory" " /memory" preopen

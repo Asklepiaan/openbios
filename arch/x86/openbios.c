@@ -20,9 +20,11 @@
 #include "relocate.h"
 #include "boot.h"
 
+#define WINTERBOOT_OPENBIOS_SKIP_PLATFORM_PROBES 1
+
 void collect_sys_info(struct sys_info *info);
 
-#ifdef CONFIG_DRIVER_PCI
+#if defined(CONFIG_DRIVER_PCI) && !WINTERBOOT_OPENBIOS_SKIP_PLATFORM_PROBES
 static const pci_arch_t default_pci_host = {
     .name = "Intel,i440FX",
     .vendor_id = PCI_VENDOR_ID_INTEL,
@@ -49,15 +51,15 @@ arch_init( void )
 {
 	openbios_init();
 	modules_init();
-#ifdef CONFIG_DRIVER_PCI
+#if defined(CONFIG_DRIVER_PCI) && !WINTERBOOT_OPENBIOS_SKIP_PLATFORM_PROBES
         arch = &default_pci_host;
 	ob_pci_init();
 #endif
-#ifdef CONFIG_DRIVER_IDE
+#if defined(CONFIG_DRIVER_IDE) && !WINTERBOOT_OPENBIOS_SKIP_PLATFORM_PROBES
 	setup_timers();
 	ob_ide_init("/pci/isa", 0x1f0, 0x3f4, 0x170, 0x374);
 #endif
-#ifdef CONFIG_DRIVER_FLOPPY
+#if defined(CONFIG_DRIVER_FLOPPY) && !WINTERBOOT_OPENBIOS_SKIP_PLATFORM_PROBES
 	ob_floppy_init("/isa", "floppy0", 0x3f0, 0);
 #endif
 #ifdef CONFIG_XBOX
@@ -67,6 +69,7 @@ arch_init( void )
 	device_end();
 	bind_func("platform-boot", boot );
 	bind_func("(go)", go );
+	bind_func("winterboot", winterboot );
 }
 
 int openbios(void)
