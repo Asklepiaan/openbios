@@ -1,9 +1,4 @@
 	.globl	entry, __switch_context, __exit_context, halt, init_exceptions
-	.globl	init_winterboot_service_idt
-
-	.equ	WINTERBOOT_SERVICE_VECTOR, 0x90
-	.equ	RELOC_CS_SELECTOR, 0x18
-	.equ	RELOC_DS_SELECTOR, 0x20
 
 	.text
 	.align	4
@@ -127,14 +122,12 @@ halt:
 
 init_exceptions:
 	pushl	%ebx
-	pushl	%ecx
 	pushl	%edi
 
         /* Initialize the Interrupt Descriptor table */
         leal    _idt, %edi
         leal    vec0, %ebx
         movl    $(0x08 << 16), %eax     /* cs selector */
-	leal	_idt + (20 * 8), %ecx
 
 1:      movw    %bx, %ax
         movl    %ebx, %edx
@@ -143,7 +136,7 @@ init_exceptions:
         movl    %edx, 4(%edi)
         addl    $6, %ebx
         addl    $8, %edi
-        cmpl    %ecx, %edi
+        cmpl    $_idt_end, %edi
         jne     1b
 
         /* Load the Interrupt descriptor table */
@@ -151,84 +144,8 @@ init_exceptions:
 
 	movl 	$0, %eax
 	popl	%edi
-	popl	%ecx
 	popl	%ebx
 	ret
-
-init_winterboot_service_idt:
-	pushl	%eax
-	pushl	%ebx
-	pushl	%ecx
-	pushl	%edx
-	pushl	%edi
-
-	/* Rebuild the exception entries for the relocated OpenBIOS code segment. */
-	leal	_idt, %edi
-	leal	vec0, %ebx
-	movl	$(RELOC_CS_SELECTOR << 16), %eax
-	leal	_idt + (20 * 8), %ecx
-1:	movw	%bx, %ax
-	movl	%ebx, %edx
-	movw	$0x8E00, %dx
-	movl	%eax, 0(%edi)
-	movl	%edx, 4(%edi)
-	addl	$6, %ebx
-	addl	$8, %edi
-	cmpl	%ecx, %edi
-	jne	1b
-
-	/* Add the WinterBoot protected-mode firmware service vector. */
-	leal	_idt + (WINTERBOOT_SERVICE_VECTOR * 8), %edi
-	leal	winterboot_service_entry, %ebx
-	movl	$(RELOC_CS_SELECTOR << 16), %eax
-	movw	%bx, %ax
-	movl	%ebx, %edx
-	movw	$0x8E00, %dx
-	movl	%eax, 0(%edi)
-	movl	%edx, 4(%edi)
-
-	/* Load the relocated IDT base. */
-	subl	$8, %esp
-	movw	$(_idt_end - _idt - 1), 0(%esp)
-	movl	virt_offset, %eax
-	addl	$_idt, %eax
-	movl	%eax, 2(%esp)
-	lidt	0(%esp)
-	addl	$8, %esp
-
-	popl	%edi
-	popl	%edx
-	popl	%ecx
-	popl	%ebx
-	popl	%eax
-	ret
-
-winterboot_service_entry:
-	pushl	%ds
-	pushl	%es
-	pushl	%fs
-	pushl	%gs
-	pushal
-	cld
-
-	movw	$RELOC_DS_SELECTOR, %ax
-	movw	%ax, %ds
-	movw	%ax, %es
-	movw	%ax, %fs
-	movw	%ax, %gs
-
-	movl	%esp, %eax
-	subl	virt_offset, %eax
-	pushl	%eax
-	call	winterboot_service_dispatch
-	addl	$4, %esp
-
-	popal
-	popl	%gs
-	popl	%fs
-	popl	%es
-	popl	%ds
-	iret
 
 vec0:
         pushl   $0 /* error code */
@@ -383,7 +300,7 @@ idtarg:
         .long   _idt
         .word   0
 _idt:
-        .fill   256, 8, 0        # idt is initialized
+        .fill   20, 8, 0        # idt is unitiailzed
 _idt_end:
 
         .globl  arch_nvram_size, arch_nvram_get, arch_nvram_put

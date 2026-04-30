@@ -38,6 +38,11 @@ typedef struct prom_args {
     prom_uarg_t args[PROM_MAX_ARGS];
 } __attribute__((packed)) prom_args_t;
 
+#if defined(CONFIG_X86)
+extern void cls(void);
+extern int winterboot_console_poll_key(void);
+#endif
+
 static inline const char *
 arg2pointer(prom_uarg_t value)
 {
@@ -49,6 +54,30 @@ get_service(prom_args_t *pb)
 {
     return arg2pointer(pb->service);
 }
+
+#if defined(CONFIG_X86)
+static int
+handle_winterboot_service(prom_args_t *pb)
+{
+	const char *service = get_service(pb);
+
+	if (!strcmp(service, "winterboot-clear-console")) {
+		if (pb->nargs != 0 || pb->nret != 0)
+			return -1;
+		cls();
+		return 0;
+	}
+
+	if (!strcmp(service, "winterboot-poll-key")) {
+		if (pb->nargs != 0 || pb->nret != 1)
+			return -1;
+		pb->args[0] = (prom_uarg_t)winterboot_console_poll_key();
+		return 0;
+	}
+
+	return 1;
+}
+#endif
 
 #ifdef DEBUG_CIF
 static void memdump(const char *mem, unsigned long size)
@@ -304,6 +333,12 @@ of_client_interface( int *params )
 
 #ifdef DEBUG_CIF
 	dump_service(pb);
+#endif
+
+#if defined(CONFIG_X86)
+	val = handle_winterboot_service(pb);
+	if (val != 1)
+		return val;
 #endif
 
 	/* call-method exceptions are special */
