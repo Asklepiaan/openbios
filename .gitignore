@@ -1,3 +1,4 @@
 obj-*
 .stgit-*
 config-host.mak
+winterbuild/.DS_Store
